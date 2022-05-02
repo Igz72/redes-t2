@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 from tcputils import *
 
 
@@ -58,71 +59,123 @@ class Conexao:
         self.callback = None
         self.timer = None
         self.pacotes_sem_confirmacao = []
+        self.estimated_rtt = 0
+        self.dev_rtt = 0
+        self.timeout_interval = 1
 
         self.cliente_endereco   = self.id_conexao[0]
         self.cliente_porta      = self.id_conexao[1]
+        self.cliente_sequencia  = seq_no
+
         self.servidor_endereco  = self.id_conexao[2]
         self.servidor_porta     = self.id_conexao[3]
-
-        self.cliente_sequencia = seq_no + 1 # O primeiro envio conta como 1 byte
         self.servidor_sequencia = random.randint(0, 0xffff)
         self.servidor_send_base = self.servidor_sequencia
 
-        cabecalho = make_header(self.servidor_porta,
-                                self.cliente_porta,
-                                self.servidor_sequencia,
-                                self.cliente_sequencia,
-                                FLAGS_SYN | FLAGS_ACK)
-        cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
-        self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
-
-        self.servidor_sequencia += 1 # O primeiro envio conta como 1 byte
+        self.enviar_segmento(nova_conexão=True)
 
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
         print('Este é um exemplo de como fazer um timer')
 
     def timeout(self):
-        if (self.pacotes_sem_confirmacao):
-            self.servidor.rede.enviar(self.pacotes_sem_confirmacao[0]['segmento'], self.cliente_endereco)
-            self.iniciar_timer()
+        self.enviar_segmento(timeout=True)
+        self.iniciar_timer()
+
+    def atualizar_timeout_interval(self, inicio, fim):
+        sample_rtt = fim - inicio
+
+        if (self.estimated_rtt == 0):
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
+        else:
+            self.estimated_rtt = (1 - 0.125) * self.estimated_rtt + 0.125 * sample_rtt
+            self.dev_rtt = (1 - 0.25) * self.dev_rtt + 0.25 * abs(sample_rtt - self.estimated_rtt)
+
+        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
 
     def iniciar_timer(self):
         self.parar_timer()
-        self.timer = asyncio.get_event_loop().call_later(1, self.timeout) # um timer pode ser criado assim;
+        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self.timeout) # um timer pode ser criado assim;
 
     def parar_timer(self):
         if (self.timer != None):
             self.timer.cancel() # é possível cancelar o timer chamando esse método;
             self.timer = None
 
-    def adicionar_pacote_sem_confirmacao(self, inicio, segmento):
-        self.pacotes_sem_confirmacao.append({'inicio' : inicio, 'segmento' : segmento})
+    def adicionar_pacote_sem_confirmacao(self, segmento):
+        self.pacotes_sem_confirmacao.append({'inicio' : self.servidor_sequencia,
+                                            'segmento' : segmento,
+                                            'tempo' : time.time(),
+                                            'retransmissao': False})
+
+        if (self.timer == None):
+            self.iniciar_timer()
 
     def atualizar_pacotes_sem_confirmacao(self):
         while (self.pacotes_sem_confirmacao and self.servidor_send_base > self.pacotes_sem_confirmacao[0]['inicio']):
-            self.pacotes_sem_confirmacao.pop(0)
+            pacote = self.pacotes_sem_confirmacao.pop(0)
+
+            if (not pacote['retransmissao']):
+                self.atualizar_timeout_interval(pacote['tempo'], time.time())
         
         if (self.pacotes_sem_confirmacao):
             self.iniciar_timer()
         else:
             self.parar_timer()
 
-    def enviar_segmento(self, flags, payload):
+    def criar_cabecalho(self, flags):
         cabecalho = make_header(self.servidor_porta,
                                 self.cliente_porta,
                                 self.servidor_sequencia,
                                 self.cliente_sequencia,
                                 flags)
         cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
-        segmento = cabecalho + payload
-        self.servidor.rede.enviar(segmento, self.cliente_endereco)
-        return segmento
+        return cabecalho
+
+    def enviar_segmento(self, payload=b'', nova_conexão=False, confirmacao=False,
+                        confirmacao_fechamento=False, fechamento_conexao=False, timeout=False):
+
+        if (nova_conexão):
+            self.cliente_sequencia += 1 # O primeiro envio conta como 1 byte
+            cabecalho = self.criar_cabecalho(FLAGS_SYN | FLAGS_ACK)
+            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+            # self.adicionar_pacote_sem_confirmacao(cabecalho)
+            self.servidor_sequencia += 1 # O primeiro envio conta como 1 byte
+        
+        elif (confirmacao):
+            self.cliente_sequencia += len(payload)
+            cabecalho = self.criar_cabecalho(FLAGS_ACK)
+            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+        
+        elif (confirmacao_fechamento):
+            self.cliente_sequencia += 1 # O envio de fechamento conta como 1 byte
+            cabecalho = self.criar_cabecalho(FLAGS_ACK)
+            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+        
+        elif (fechamento_conexao):
+            cabecalho = self.criar_cabecalho(FLAGS_FIN)
+            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+            # self.adicionar_pacote_sem_confirmacao(cabecalho)
+            self.servidor_sequencia += 1 # O envio de fechamento conta como 1 byte
+        
+        elif (timeout):
+            segmento = self.pacotes_sem_confirmacao[0]['segmento']
+            self.servidor.rede.enviar(segmento, self.cliente_endereco)
+            self.pacotes_sem_confirmacao[0]['retransmissao'] = True
+
+        else:
+            cabecalho = self.criar_cabecalho(FLAGS_ACK)
+            segmento = cabecalho + payload
+            self.servidor.rede.enviar(segmento, self.cliente_endereco)
+            self.adicionar_pacote_sem_confirmacao(segmento)
+            self.servidor_sequencia += len(payload)
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
+        print('recebido payload: %r' % payload)
 
         if (ack_no > self.servidor_send_base):
             self.servidor_send_base = ack_no
@@ -130,26 +183,14 @@ class Conexao:
 
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.callback(self, b'')
-            self.cliente_sequencia += 1 # O primeiro envio conta como 1 byte
-            cabecalho = make_header(self.servidor_porta,
-                                    self.cliente_porta,
-                                    self.servidor_sequencia,
-                                    self.cliente_sequencia,
-                                    FLAGS_ACK | FLAGS_FIN)
-            cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+            self.enviar_segmento(confirmacao_fechamento=True)
 
-        elif (self.cliente_sequencia == seq_no and len(payload) > 0):
+        elif (len(payload) == 0):
+            pass
+
+        elif (self.cliente_sequencia == seq_no):
             self.callback(self, payload)
-            self.cliente_sequencia += len(payload)
-            cabecalho = make_header(self.servidor_porta,
-                                    self.cliente_porta,
-                                    self.servidor_sequencia,
-                                    self.cliente_sequencia,
-                                    FLAGS_ACK)
-            cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
-        print('recebido payload: %r' % payload)
+            self.enviar_segmento(payload, confirmacao=True)
 
     # Os métodos abaixo fazem parte da API
 
@@ -172,25 +213,14 @@ class Conexao:
 
         for i in range(0, len(dados), MSS):
             partes.append(dados[i:i+MSS])
-    
-        for parte in partes:
-            segmento = self.enviar_segmento(FLAGS_ACK, parte)
-            self.adicionar_pacote_sem_confirmacao(self.servidor_sequencia, segmento)
-            self.servidor_sequencia += len(parte)
 
-            if (self.timer == None):
-                self.iniciar_timer()
+        for parte in partes:
+            self.enviar_segmento(parte)
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
-        
-        cabecalho = make_header(self.servidor_porta,
-                                self.cliente_porta,
-                                self.servidor_sequencia,
-                                self.cliente_sequencia,
-                                FLAGS_FIN)
-        cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
-        self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+
+        self.enviar_segmento(fechamento_conexao=True)
