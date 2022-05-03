@@ -59,6 +59,10 @@ class Conexao:
         self.callback = None
         self.timer = None
         self.pacotes_sem_confirmacao = []
+        self.pacotes_nao_enviados = []
+        self.tamanho_pacotes_nao_enviados = 0
+        self.tamanho_pacotes_nao_confirmados = 0
+        self.tamanho_janela = MSS
         self.estimated_rtt = 0
         self.dev_rtt = 0
         self.timeout_interval = 1
@@ -79,6 +83,7 @@ class Conexao:
         print('Este é um exemplo de como fazer um timer')
 
     def timeout(self):
+        self.tamanho_janela /= 2
         self.enviar_segmento(timeout=True)
         self.iniciar_timer()
 
@@ -89,7 +94,7 @@ class Conexao:
             self.estimated_rtt = sample_rtt
             self.dev_rtt = sample_rtt / 2
         else:
-            self.estimated_rtt = (1 - 0.125) * self.estimated_rtt + 0.125 * sample_rtt
+            self.estimated_rtt = (1 - 0.125) * self.estimated_rtt + 0.150 * sample_rtt
             self.dev_rtt = (1 - 0.25) * self.dev_rtt + 0.25 * abs(sample_rtt - self.estimated_rtt)
 
         self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
@@ -103,11 +108,12 @@ class Conexao:
             self.timer.cancel() # é possível cancelar o timer chamando esse método;
             self.timer = None
 
-    def adicionar_pacote_sem_confirmacao(self, segmento):
-        self.pacotes_sem_confirmacao.append({'inicio' : self.servidor_sequencia,
+    def adicionar_pacote_sem_confirmacao(self, segmento, inicio):
+        self.pacotes_sem_confirmacao.append({'inicio' : inicio,
                                             'segmento' : segmento,
                                             'tempo' : time.time(),
                                             'retransmissao': False})
+        self.tamanho_pacotes_nao_confirmados += len(segmento)
 
         if (self.timer == None):
             self.iniciar_timer()
@@ -115,6 +121,7 @@ class Conexao:
     def atualizar_pacotes_sem_confirmacao(self):
         while (self.pacotes_sem_confirmacao and self.servidor_send_base > self.pacotes_sem_confirmacao[0]['inicio']):
             pacote = self.pacotes_sem_confirmacao.pop(0)
+            self.tamanho_pacotes_nao_confirmados -= len(pacote['segmento'])
 
             if (not pacote['retransmissao']):
                 self.atualizar_timeout_interval(pacote['tempo'], time.time())
@@ -123,6 +130,8 @@ class Conexao:
             self.iniciar_timer()
         else:
             self.parar_timer()
+
+        self.enviar_pacotes_nao_enviados()
 
     def criar_cabecalho(self, flags):
         cabecalho = make_header(self.servidor_porta,
@@ -133,43 +142,58 @@ class Conexao:
         cabecalho = fix_checksum(cabecalho, self.cliente_endereco, self.servidor_endereco)
         return cabecalho
 
+    def adicionar_pacote_nao_enviado(self, pacote, confirmacao=False, inicio=0):
+        self.pacotes_nao_enviados.append({'pacote' : pacote, 'confirmacao' : confirmacao, 'inicio' : inicio})
+        self.tamanho_pacotes_nao_enviados += len(pacote)
+
+    def enviar_pacotes_nao_enviados(self):
+        while (self.pacotes_nao_enviados and 
+                len(self.pacotes_nao_enviados[0]['pacote']) +
+                self.tamanho_pacotes_nao_confirmados <= self.tamanho_janela):
+
+            pacote = self.pacotes_nao_enviados.pop(0)
+            self.tamanho_pacotes_nao_enviados -= len(pacote['pacote'])
+            self.servidor.rede.enviar(pacote['pacote'], self.cliente_endereco)
+        
+            if (pacote['confirmacao']):
+                self.adicionar_pacote_sem_confirmacao(pacote['pacote'], pacote['inicio'])
+
     def enviar_segmento(self, payload=b'', nova_conexão=False, confirmacao=False,
                         confirmacao_fechamento=False, fechamento_conexao=False, timeout=False):
 
         if (nova_conexão):
             self.cliente_sequencia += 1 # O primeiro envio conta como 1 byte
             cabecalho = self.criar_cabecalho(FLAGS_SYN | FLAGS_ACK)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
-            # self.adicionar_pacote_sem_confirmacao(cabecalho)
             self.servidor_sequencia += 1 # O primeiro envio conta como 1 byte
+            self.adicionar_pacote_nao_enviado(cabecalho)
         
         elif (confirmacao):
             self.cliente_sequencia += len(payload)
             cabecalho = self.criar_cabecalho(FLAGS_ACK)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+            self.adicionar_pacote_nao_enviado(cabecalho)
         
         elif (confirmacao_fechamento):
             self.cliente_sequencia += 1 # O envio de fechamento conta como 1 byte
             cabecalho = self.criar_cabecalho(FLAGS_ACK)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
+            self.adicionar_pacote_nao_enviado(cabecalho)
         
         elif (fechamento_conexao):
             cabecalho = self.criar_cabecalho(FLAGS_FIN)
-            self.servidor.rede.enviar(cabecalho, self.cliente_endereco)
-            # self.adicionar_pacote_sem_confirmacao(cabecalho)
             self.servidor_sequencia += 1 # O envio de fechamento conta como 1 byte
+            self.adicionar_pacote_nao_enviado(cabecalho)
         
         elif (timeout):
             segmento = self.pacotes_sem_confirmacao[0]['segmento']
-            self.servidor.rede.enviar(segmento, self.cliente_endereco)
             self.pacotes_sem_confirmacao[0]['retransmissao'] = True
+            self.servidor.rede.enviar(segmento, self.cliente_endereco)
 
         else:
             cabecalho = self.criar_cabecalho(FLAGS_ACK)
             segmento = cabecalho + payload
-            self.servidor.rede.enviar(segmento, self.cliente_endereco)
-            self.adicionar_pacote_sem_confirmacao(segmento)
+            self.adicionar_pacote_nao_enviado(segmento, confirmacao=True, inicio=self.servidor_sequencia)
             self.servidor_sequencia += len(payload)
+
+        self.enviar_pacotes_nao_enviados()
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
@@ -180,6 +204,8 @@ class Conexao:
         if (ack_no > self.servidor_send_base):
             self.servidor_send_base = ack_no
             self.atualizar_pacotes_sem_confirmacao()
+            self.tamanho_janela += MSS
+            self.enviar_pacotes_nao_enviados()
 
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.callback(self, b'')
